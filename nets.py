@@ -9,6 +9,8 @@ import os
 import torchvision.transforms as transforms
 from dataloader import enhance_uncertainty
 import matplotlib.pyplot as plt
+from collections import OrderedDict
+from torchvision.models import resnet152, ResNet152_Weights
 
 
 def LossPredLoss(input, target, margin=1.0, reduction='mean'):
@@ -77,6 +79,32 @@ def uncertainty_transformation(rd):
         ])
     return transform
 
+def _load_imagenet_backbone_into(model):
+    try:
+        tv_sd = resnet152(weights=ResNet152_Weights.IMAGENET1K_V2).state_dict()
+    except Exception:
+        # older torchvision fallback
+        tv_sd = resnet152(pretrained=True).state_dict()
+
+    msd = model.state_dict()
+    def map_key(k):
+        # map torchvision names -> your ResNet names
+        k = k.replace('bn', 'batch_norm')          # bn1 -> batch_norm1
+        k = k.replace('downsample', 'i_downsample')
+        return k
+
+    keep = OrderedDict()
+    for k, v in tv_sd.items():
+        if k.startswith('fc.'):            # skip FC head
+            continue
+        k2 = map_key(k)
+        if k2 in msd and msd[k2].shape == v.shape:
+            keep[k2] = v
+
+    missing, unexpected = model.load_state_dict(keep, strict=False)
+    print(f"[init] loaded backbone tensors: {len(keep)}")
+    if missing:    print("[init] missing keys (ok):", missing[:10], "…")
+    if unexpected: print("[init] unexpected keys (ok):", unexpected[:10], "…")
 
 class Net:
     def __init__(self, net, params, device, root, net_stage_II, net_loss=None):
@@ -86,10 +114,13 @@ class Net:
         self.root = root
         self.net_stage_II = net_stage_II(num_classes=1).to(self.device)
         self.net_loss = net_loss
+        self.use_imagenet_backbone = getattr(self, 'use_imagenet_backbone', False)
 
     def train(self, data, round):
         n_epoch = self.params['n_epoch']
         self.clf = self.net(num_classes=6).to(self.device)
+        if getattr(self, 'use_imagenet_backbone', False):
+            _load_imagenet_backbone_into(self.clf)
         self.clf.train()
         optimizer = optim.SGD(self.clf.parameters(), **self.params['optimizer_args'])
 
@@ -106,6 +137,10 @@ class Net:
         torch.save(self.clf.state_dict(), save_model_path)
 
     def predict(self, data):
+        if not hasattr(self, 'clf'):
+            self.clf = self.net(num_classes=6).to(self.device)
+            if getattr(self, 'use_imagenet_backbone', False):
+                _load_imagenet_backbone_into(self.clf)
         self.clf.eval()
         acc = 0
         preds = torch.zeros(len(data), dtype=torch.int64)
@@ -136,6 +171,9 @@ class Net:
                 optimizer.zero_grad()
                 reg_result = self.net_stage_II(features)
                 reg_result = reg_result.squeeze(1)
+                rank = rank.view(-1)
+                if reg_result.shape != rank.shape:
+                    raise RuntimeError(f"shape mismatch: {reg_result.shape} vs {rank.shape}")
 
                 """
                 here is classification prob, ce loss
@@ -163,12 +201,12 @@ class Net:
                 # loss = 0.5*loss2 + 0.5*loss1
                 # loss_record.append(loss.detach().cpu().numpy())
 
-                print("loss_{}".format(loss))
+                #print("loss_{}".format(loss))
                 loss.backward()
                 # clipping
                 torch.nn.utils.clip_grad_norm_(self.net_stage_II.parameters(), max_norm=1.0)
                 optimizer.step()
-        print(loss_record)
+        #print(loss_record)
         plt.plot(loss_record)
         if not os.path.exists(os.path.join(self.root, 'loss')):
             os.mkdir(os.path.join(self.root, 'loss'))
@@ -208,6 +246,7 @@ class Net:
     def predict_wsi_score(self, data):
         self.clf = self.net(num_classes=6).to(self.device)
         clf_path = './active_learning/exp/methodMY exp_MY_stage_II_seed_35_res101_module_simple_run_9_log_score_mse_loss/round_6.pth'
+        #clf_path = '/home/drf/TCSegNet/weight/iter_10000.pth'
         net_II_path = './active_learning/exp/methodMY exp_MY_stage_II_seed_35_res101_module_simple_run_9_log_score_mse_loss/stage_II_round_1.pth'
         self.clf.load_state_dict(torch.load(clf_path, map_location='cuda:1'))
         self.net_stage_II.load_state_dict(torch.load(net_II_path, map_location='cuda:1'))
@@ -295,6 +334,7 @@ class Net:
     def get_mil(self, data):
         self.clf = self.net(num_classes=6).to(self.device)
         clf_path = './active_learning/exp/methodMY exp_MY_stage_II_seed_35_res101_module_simple_run_9_log_score_mse_loss/round_6.pth'
+        #clf_path = '/home/drf/TCSegNet/wht/iter_10000.pth'
         self.clf.load_state_dict(torch.load(clf_path, map_location='cuda:1'))
         self.clf.eval()
         embeddings = torch.zeros([len(data), self.clf.get_embedding_dim()])

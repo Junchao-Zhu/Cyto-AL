@@ -13,29 +13,58 @@ import torch
 #     tmp = np.load(label_path, allow_pickle=True).item()
 #     return tmp.get(file)[0]
 
-def get_label(file):
-    for d in os.listdir('./dataset_final_6'):
-        if file in os.listdir(os.path.join('./dataset_final_6', d)):
-            cls = int(d) - 1
-            return cls
+# def get_label(file):
+#     for d in os.listdir('./dataset_final_6'):
+#         if file in os.listdir(os.path.join('./dataset_final_6', d)):
+#             cls = int(d) - 1
+#             return cls
 
+def get_label(file):
+    # for d in os.listdir('/data1/yx/data/dataset_final_6'):
+    #     if file in os.listdir(os.path.join('/data1/yx/data/dataset_final_6', d)):
+    #         cls = int(d) - 1
+    #         return cls
+        
+    parent = os.path.basename(os.path.dirname(file))
+    return int(parent) - 1
 
 def get_density(file):
     img_pred = Image.open(file)
     tmp = np.sum(np.array(img_pred))/ (224*224*255)
     return tmp
 
+# 从文件名提取png的(x,y)坐标
+def get_location(filepath):
+    filename = os.path.basename(filepath)
+    if filename.endswith('.png'):
+        filename = filename[:-4]
+    parts = filename.split('_')
 
-def get_location(file):
-    tmp = file.split("_")
-    if tmp[1] != 'row' and tmp[1] != 'x':
-        x = int(tmp[1])
-        y = int(tmp[2])
-    else:
-        x = int(tmp[2])
-        y = int(tmp[4][:-4])
-    location = (x, y)
-    return location
+    try:
+        if 'row' in parts and 'col' in parts:
+            y = int(parts[parts.index('row') + 1])
+            x = int(parts[parts.index('col') + 1])
+        elif 'x' in parts and 'y' in parts:
+            x = int(parts[parts.index('x') + 1])
+            y = int(parts[parts.index('y') + 1])
+        else:
+            # fallback: assume last two numeric parts are x and y
+            x = int(parts[-3])
+            y = int(parts[-2])
+        return (x, y)
+    except (ValueError, IndexError) as e:
+        raise ValueError(f"Unexpected filename format: {filename}") from e
+    
+# def get_location(file):
+#     tmp = file.split("_")
+#     if tmp[1] != 'row' and tmp[1] != 'x':
+#         x = int(tmp[1])
+#         y = int(tmp[2])
+#     else:
+#         x = int(tmp[2])
+#         y = int(tmp[4][:-4])
+#     location = (x, y)
+#     return location
 
 
 def get_wsi_name(file):
@@ -58,20 +87,29 @@ def calculate_color_statistics(image):
 
 
 def make_dataset(root):
-    img_list = [os.path.splitext(f)[0] for f in os.listdir(root) if f.endswith('.png')]
+    # img_list = [os.path.splitext(f)[0] for f in os.listdir(root) if f.endswith('.png')]
+    img_list = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        for f in filenames:
+            if f.lower().endswith('.png'):
+                img_list.append(os.path.join(dirpath, f))
     data_list = []
     count = 0
-    for img_name in tqdm(img_list):
-        img_path = os.path.join('img', img_name + '.png')
-        cls = get_label(img_name + '.png')
-        den = get_density(img_name + '.png')
-        location = get_location(img_name + '.png')
-        wsi_name = get_wsi_name(img_name + '.png')
-        data_list.append((img_path,
+    for img_name in tqdm(img_list, desc="Gathering"):
+        # img_path = os.path.join('img', img_name + '.png')
+        img_path = os.path.join(root, img_name + '.png')
+        cls = get_label(img_name)
+        den = get_density(img_name)
+        location = get_location(img_name)
+        x, y = location
+        wsi_name = get_wsi_name(img_name)
+        data_list.append((img_name,
                           cls,
                           den,
                           location,
-                          wsi_name
+                          wsi_name,
+                          x,
+                          y
                           ))
         count += 1
     return data_list
@@ -87,6 +125,11 @@ class basic_pool(data.Dataset):
 
     def __getitem__(self, idx):
         img_path, cls, density, location, wsi_name, x, y = self.imgs[idx]
+        sample = (img_path, cls, density, location, wsi_name, x, y)
+        # print(f"[DEBUG] Density at index {idx}: {density}")
+        if any(s is None for s in sample):
+            print("Bad sample at index", idx, "→", sample)
+            raise RuntimeError("Found None in sample!")
 
         img = Image.open(os.path.join('./labeled data', img_path)).convert('RGB')
         img = self.transform(img)
