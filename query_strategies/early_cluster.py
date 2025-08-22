@@ -26,13 +26,24 @@ def generate_list(a, b, n):
 class density_cluster(Strategy):
     def __init__(self, data, net):
         super(density_cluster, self).__init__(data, net)
+        # exposed hyperparameters
+        # self.k_cluster = 50
+        self.k_cluster = 50
+        # self.density_threshold = 0.075
+        self.density_threshold = 0.075
+        self.num_ranked_samples = 2050 # default original was 2050
 
+    def get_hparams(self):
+        return (self.k_cluster, self.density_threshold, self.num_ranked_samples)
+    
     def query(self, n):
         """
         preparation for clustering, including get density, feature and uncertainty
         """
         # get cell density
-        n_cluster = 50
+        # Num of k-means clusters
+        #n_cluster = 50
+        n_cluster = self.k_cluster
         unlabeled_idxs, unlabeled_data = self.dataset.get_unlabeled_data()
 
         # get latent feature
@@ -70,13 +81,37 @@ class density_cluster(Strategy):
         density_prob = -rankdata(density.squeeze(1)) / density.squeeze(1).shape[0]
 
         """
-        low_density_filtering: filter images which cellularity smaller than 0.02 conclude as level I
+        low_density_filtering: filter out patches whose cellularity is smaller than FIXED_THR!!
         """
-        low_density_idxs = np.where(density < 0.075)[0]
+        # Tunables (no args, change here if needed)
+        FIXED_THR = self.density_threshold            # original low-density threshold
+        PCT_FALLBACK = 20                             # fallback percentile if empty (use lowest 20% to be filtered out if fixed threshold yields none)
+        TOP_RANKED_SAMPLES = self.num_ranked_samples  # batch size of ranking stage (top-ranked patches acquired when Ranking Learning Module is used)
+        
+        LOW_QUOTA = 20    # how many low-density samples to add back (exploration)
+# ---------------- low-density handling (threshold -> percentile -> lowest-N) ----------------
+        # low_density_idxs = np.where(density < 0.075)[0]
+        low_density_idxs = np.where(density < FIXED_THR)[0]
+        if low_density_idxs.size == 0:
+            thr = np.percentile(density, PCT_FALLBACK)
+            low_density_idxs = np.where(density <= thr)[0]
+        if low_density_idxs.size == 0:
+            order = np.argsort(density)  # ascending: lowest first
+            low_density_idxs = order[:min(LOW_QUOTA, order.size)]
+
+        print(f"unlabeled size: {len(unlabeled_idxs)}")
+        print(f"low_density count: {len(low_density_idxs)} "
+            f"({len(low_density_idxs)/len(unlabeled_idxs):.3%})")
+        print("density stats:",
+            f"min={density.min():.4f}  p5={np.percentile(density,5):.4f}  "
+            f"median={np.median(density):.4f}  p95={np.percentile(density,95):.4f}  "
+            f"max={density.max():.4f}")
+        print("low_density_idxs count: ", int(low_density_idxs.size))
+                
         for i in range(n_cluster):
             tmp_cluster = np.arange(embeddings.shape[0])[cluster_idxs == i]
             tmp_idx_ranking = torch.from_numpy(density_prob)[cluster_idxs == i].argsort()
-            num = int(2050 * tmp_cluster.flatten().shape[0] / embeddings.shape[0])
+            num = int(TOP_RANKED_SAMPLES * tmp_cluster.flatten().shape[0] / embeddings.shape[0])
             if num != 0 and num <= tmp_cluster.flatten().shape[0]:
                 for j in range(num):
                     q_idxs.append(tmp_cluster.flatten()[tmp_idx_ranking[j]])
@@ -85,6 +120,8 @@ class density_cluster(Strategy):
                     q_idxs.append(tmp_cluster.flatten()[tmp_idx_ranking[j]])
 
         q_idxs = np.array(q_idxs).flatten()
+        # Everything with density < threshold goes into low_density_idxs, and those indices are removed from the primary (high-cellularity/proportional) picks
+        # np.setdiff1d(A, B) returns the sorted unique values in A that are not in B
         q_idxs = np.setdiff1d(q_idxs, low_density_idxs)
 
         q_low_den_idxs = []
@@ -95,8 +132,8 @@ class density_cluster(Strategy):
         q_idxs = np.concatenate((q_idxs, np.array(q_low_den_idxs)), axis=0)
 
         q_random_idxs = []
-        if q_idxs.shape[0] < 2050:
-            diff = 2050-q_idxs.shape[0]
+        if q_idxs.shape[0] < TOP_RANKED_SAMPLES:
+            diff = TOP_RANKED_SAMPLES - q_idxs.shape[0]
             wait_list = np.setdiff1d(np.arange(embeddings.shape[0]), np.array(q_idxs))
             wait_list = np.setdiff1d(wait_list, low_density_idxs)
             random_selected = np.random.choice(wait_list, size=diff, replace=False)
@@ -190,30 +227,73 @@ class density_cluster(Strategy):
         return unlabeled_idxs[np.array(q_idxs).flatten()], unlabeled_idxs[data_stage_II_idx], data_stage_II_rank
 
     def query_second_stage_version_II(self, n):
+        # Tunables
+        FIXED_THR = self.density_threshold
+        PCT_FALLBACK = 20
+        LOW2_QUOTA = 10  # originally set to 10
+
+        # ε-greedy hyperparams
+        EPS = 0.05      # 5% exploration
+        BAND_MULT = 5   # explore from a near-top band
+
         unlabeled_idxs, unlabeled_data = self.dataset.get_unlabeled_data()
         pred_rank = self.predict_rank(unlabeled_data).numpy().squeeze(1)
         q_idxs = []
-        density = self.get_density(unlabeled_data)
-        low_density_idxs = np.where(density < 0.075)[0]
+        
+        # compute density (optional in query_second_stage)
+        # density = self.get_density(unlabeled_data)
+        # # low_density_idxs = np.where(density < 0.075)[0] # filter out low density patches!!
+        # # Low-density bucket with robust fallbacks
+        # low_density_idxs = np.where(density < FIXED_THR)[0]
+        # if low_density_idxs.size == 0:
+        #     thr = np.percentile(density, PCT_FALLBACK)
+        #     low_density_idxs = np.where(density <= thr)[0]
+        # if low_density_idxs.size == 0:
+        #     order = np.argsort(density)
+        #     low_density_idxs = order[:min(LOW2_QUOTA, order.size)]
+                
+        low_density_idxs = np.array([], dtype=int)   # no low-density filtering
 
         """
         Following code is used in regression prediction
         """
         sorted_indices = pred_rank.argsort()
-        for i in range(2050):
+
+        # ε-greedy near-top selection (no density)
+        n_query = int(n)
+        topN = min(n_query, sorted_indices.shape[0])
+        n_explore = int(round(EPS * topN))
+        n_explore = max(0, min(n_explore, topN))
+        n_main = topN - n_explore
+
+        # main picks: strict top
+        for i in range(n_main):
             q_idxs.append(sorted_indices[i])
+
+        # exploration: random from a near-top band
+        band_hi = min(sorted_indices.shape[0], n_main + BAND_MULT * max(1, n_explore))
+        candidates = sorted_indices[n_main:band_hi]
+        if n_explore > 0 and candidates.size > 0:
+            explore = np.random.choice(candidates, size=min(n_explore, candidates.size), replace=False)
+            q_idxs = np.concatenate((np.array(q_idxs, dtype=int), explore), axis=0)
+        else:
+            q_idxs = np.array(q_idxs, dtype=int)
 
         q_idxs = np.setdiff1d(np.array(q_idxs), low_density_idxs)
 
         wait_list = np.setdiff1d(np.arange(unlabeled_idxs.shape[0]), np.array(q_idxs))
         wait_list = np.setdiff1d(wait_list, low_density_idxs)
-        diff = 2050 - q_idxs.shape[0]
-        if diff > 0:
-            random_selected = np.random.choice(wait_list, size=diff, replace=False)
+        diff = n_query - q_idxs.shape[0]
+        if diff > 0 and wait_list.size > 0:
+            random_selected = np.random.choice(wait_list, size=min(diff, wait_list.size), replace=False)
             q_idxs = np.concatenate((np.array(q_idxs), random_selected), axis=0)
 
-        random_selected_low_density = np.random.choice(low_density_idxs, size=10, replace=False)
-        q_idxs = np.concatenate((np.array(q_idxs), random_selected_low_density), axis=0)
+        # guarded low-density add-back in case empty list
+        take = min(LOW2_QUOTA, low_density_idxs.size)
+        if take > 0:
+            random_selected_low_density = np.random.choice(low_density_idxs, size=take, replace=False)
+            q_idxs = np.concatenate((np.array(q_idxs), random_selected_low_density), axis=0)
+
         """
         Following code is used in classification predict
         """

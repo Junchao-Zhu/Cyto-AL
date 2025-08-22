@@ -148,7 +148,8 @@ class Strategy:
 
     def get_cls(self, idx):
         tmp_data = self.dataset.X_train[idx]
-        cls_count = torch.zeros(7)
+        #cls_count = torch.zeros(7)
+        cls_count = torch.zeros(6)
         for i in range(tmp_data.shape[0]):
             cls = tmp_data[i, 1]
             cls_count[cls] += 1
